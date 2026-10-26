@@ -18,7 +18,7 @@ ARQUERO_X, ARQUERO_Y = 58, PISO - 155
 GRAVEDAD = 0.25
 VIDAS = 5
 V_MIN, V_MAX = 5.0, 17.5
-ANG_MIN, ANG_MAX = -85.0, 75.0
+ANG_MIN, ANG_MAX = -15.0, 65.0 # Rango balístico útil: evita tiros al pasto y centra el disparo en parábolas reales
 MAX_DURACION_GENERACION = 60 * 75
 COOLDOWN = 30       # Frames de espera para disparo de flechas
 FRAMES_TENSADO = 12 # Frames fijos de tensado del arco (animación de cuerda y flecha)
@@ -42,7 +42,7 @@ NEURONAS_SALIDA = 2 #La idea es que la ia decida con que angulo disparar y con q
 
 POBLACION = 100 #Comenzamos con 100 arqueros que nos interesa que mejoren con cada generación
 ELITE = 10 #Los 10 mejores son los que pasan con sus pesos intactos a la siguiente generación, el resto se les cambia
-MUTACION = 0.10 #Probabilidad del 10% de que muten los pesos
+MUTACION = 0.08 # 8% probabilidad de mutación por peso (afina puntería sin destruir lo aprendido)
 MUTACION_SIGMAS=(0.03,0.1,0.3) #Desviaciones estándar para la mutación, 3 niveles, baja, media y alta
 
 #https://en.wikipedia.org/wiki/Sigmoid_function
@@ -80,16 +80,19 @@ class Flecha:
         self.objetivo = objetivo
         self.mejor_distancia = 9999.0 #Distancia mini registrada, menos es mejor
 
-    def actualizar(self):
-        if not self.activa:
-            return
-        self.vy += GRAVEDAD
-        self.x += self.vx
-        self.y += self.vy
-        if self.objetivo is not None and self.objetivo.vivo:
+    def subpaso(self):
+        # Avanza 0.5 frames para evitar que la flecha atraviese enemigos a alta velocidad (túnel)
+        self.vy += GRAVEDAD * 0.5
+        self.x += self.vx * 0.5
+        self.y += self.vy * 0.5
+        if self.objetivo is not None:
             d = math.hypot(self.objetivo.x - self.x, self.objetivo.y - self.y)
             if d < self.mejor_distancia:
                 self.mejor_distancia = d
+
+    def actualizar(self):
+        self.subpaso()
+        self.subpaso()
         if self.y >= PISO:
             self.y = PISO
             self.activa = False
@@ -197,11 +200,12 @@ class Juego:
         return self.carga_potencia * progreso
 
     def _recompensar_tiro_cercano(self, flecha):
-        # Si pasa a menos de 150px, nos da puntos proporcionales a la cercanía
-        if flecha.mejor_distancia < 150.0:
+        # Radio amplio (280px) para dar gradiente continuo de aprendizaje aunque el tiro quede corto
+        RADIO_SHAPING = 280.0
+        if flecha.mejor_distancia < RADIO_SHAPING:
             # Bonus adicional de aprendizaje si el objetivo era un corredor veloz
             factor = 1.8 if (flecha.objetivo and flecha.objetivo.tipo == "corredor") else 1.0
-            self.shaping += max(0.0, 1.0 - flecha.mejor_distancia / 150.0) * 4.0 * factor    
+            self.shaping += max(0.0, 1.0 - flecha.mejor_distancia / RADIO_SHAPING) * 5.0 * factor    
     
     def sensores(self): 
         #Se normalizan los 7 valores que buscamos, se toman valores de 0 a 1 para que ninguno predomine sobre el otro
@@ -271,23 +275,34 @@ class Juego:
         for flecha in self.flechas:
             if not flecha.activa:
                 continue
-            flecha.actualizar()
-            if not flecha.activa:
-                self._recompensar_tiro_cercano(flecha)
-                continue
-
-            # Chequeo colisión con enemigos
-            for enemigo in self.enemigos:
-                if not enemigo.vivo:
-                    continue
-                dx = enemigo.x - flecha.x
-                dy = enemigo.y - flecha.y
-                if dx * dx + dy * dy <= (enemigo.r + 4) ** 2:
-                    enemigo.vivo = False
+            impacto = False
+            for _ in range(2): # 2 sub-pasos por frame para evitar efecto túnel a alta velocidad
+                flecha.subpaso()
+                if flecha.y >= PISO:
+                    flecha.y = PISO
                     flecha.activa = False
-                    self.bajas += 1
-                    if enemigo.tipo == "corredor":
-                        self.shaping += 3.0 # Recompensa extra por eliminar a los corredores rápidos
+                    self._recompensar_tiro_cercano(flecha)
+                    break
+                elif flecha.x > ANCHO + 50 or flecha.x < -50:
+                    flecha.activa = False
+                    self._recompensar_tiro_cercano(flecha)
+                    break
+
+                # Chequeo colisión con enemigos en cada sub-paso
+                for enemigo in self.enemigos:
+                    if not enemigo.vivo:
+                        continue
+                    dx = enemigo.x - flecha.x
+                    dy = enemigo.y - flecha.y
+                    if dx * dx + dy * dy <= (enemigo.r + 4) ** 2:
+                        enemigo.vivo = False
+                        flecha.activa = False
+                        self.bajas += 1
+                        if enemigo.tipo == "corredor":
+                            self.shaping += 3.0 # Recompensa extra por abatir corredores rápidos
+                        impacto = True
+                        break
+                if impacto:
                     break
         
         self.enemigos = [e for e in self.enemigos if e.vivo]
