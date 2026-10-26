@@ -131,6 +131,9 @@ class Cerebro:
         else: 
             self.genes = [random.uniform(-1, 1) for _ in range(self.N1 + self.N2)] # Generamos los pesos con números aleatorios
 
+        # Historial de fitness para promediar entre generaciones y reducir ruido
+        self.hist_fit = []
+
         # Guardamos activaciones para tenerlas para dibujar
         self.entrada = [0.0] * SENSORES_ENTRADA
         self.oculta = [0.0] * SENSORES_OCULTA
@@ -164,13 +167,28 @@ class Cerebro:
         self.entrada, self.oculta, self.salida = list(x), oculta, salida
         return salida # Potencia_01 y Angulo_01
 
-    def clonar(self):
-        return Cerebro(self.genes[:])
+    def clonar(self, mantener_historial=False):
+        c = Cerebro(self.genes[:])
+        if mantener_historial:
+            c.hist_fit = self.hist_fit[:] # Conserva evaluaciones pasadas solo en élites
+        return c
 
     @staticmethod
     def cruzar(a, b):
-        # Combina los genes de dos arqueros padres
-        return Cerebro([ga if random.random() < 0.5 else gb for ga, gb in zip(a.genes, b.genes)])
+        # Cruce por neurona: preserva los pesos de cada neurona como unidad funcional
+        genes = []
+        tam_h = SENSORES_ENTRADA + 1
+        for j in range(SENSORES_OCULTA):
+            padre = a if random.random() < 0.5 else b
+            base = j * tam_h
+            genes.extend(padre.genes[base:base + tam_h])
+        tam_o = SENSORES_OCULTA + 1
+        base_o = Cerebro.N1
+        for k in range(NEURONAS_SALIDA):
+            padre = a if random.random() < 0.5 else b
+            base = base_o + k * tam_o
+            genes.extend(padre.genes[base:base + tam_o])
+        return Cerebro(genes)
 
     def mutar(self, rate, sigma):
         # Aplica las mutaciones a los pesos
@@ -226,10 +244,11 @@ class Juego:
         return self.carga_potencia * progreso
 
     def _recompensar_tiro_cercano(self, flecha):
-        # Shaping bajo (máx 1.5 pts): elimina el exploit de "farming"; matar (10 pts) siempre es superior
+        # Shaping acotado a máx 15 pts en total: evita exploit de farmeo por proximidad
         RADIO_SHAPING = 160.0
         if flecha.mejor_distancia < RADIO_SHAPING:
-            self.shaping += max(0.0, 1.0 - flecha.mejor_distancia / RADIO_SHAPING) * 1.5
+            pts = max(0.0, 1.0 - flecha.mejor_distancia / RADIO_SHAPING) * 1.5
+            self.shaping = min(15.0, self.shaping + pts)
     
     def sensores(self): 
         # 9 sensores: dist, alt, vel_x, vel_y para los 2 más cercanos + cantidad total
@@ -278,8 +297,14 @@ class Juego:
     
     def fitness(self):
         vidas_perdidas = VIDAS - self.vidas
-        # Penalización severa por vida (-20 pts): dejar pasar enemigos para farmear destruye el score
-        return self.bajas * 10.0 + self.shaping - vidas_perdidas * 20.0 + (self.tiempo / 60.0) * 1.0
+        # Score base por bajas, shaping acotado, penalización por daño y tiempo
+        score = self.bajas * 10.0 + self.shaping - vidas_perdidas * 20.0 + (self.tiempo / 60.0) * 1.0
+        # Bono explícito si completa los 75s sin perder vidas (o sobreviviendo)
+        if self.vidas == VIDAS and self.tiempo >= MAX_DURACION_GENERACION:
+            score += 60.0 # Bono clave por partida perfecta sin recibir daño
+        elif self.vidas > 0 and self.tiempo >= MAX_DURACION_GENERACION:
+            score += 20.0 # Bono por aguantar los 75s completos
+        return score
 
     def actualizar(self):
         if self.vidas <= 0 or self.tiempo>= MAX_DURACION_GENERACION: 
@@ -331,7 +356,7 @@ class Juego:
                         flecha.activa = False
                         self.bajas += 1
                         if enemigo.tipo == "corredor":
-                            self.shaping += 3.0 # Recompensa extra por abatir corredores rápidos
+                            self.shaping = min(15.0, self.shaping + 3.0) # Bonus acotado por abatir corredores rápidos
                         impacto = True
                         break
                 if impacto:
@@ -342,9 +367,12 @@ class Juego:
 class Entrenador:
     def __init__(self):
         self.generacion = 1
-        self.cerebros =[Cerebro() for _ in range (POBLACION)]
+        self.cerebros = [Cerebro() for _ in range(POBLACION)]
         self.historial = []
-        self.ultimos_sobrevivientes ="-"
+        self.ultimos_sobrevivientes = "-"
+        self.pct_perfectas = 0.0    # % de arqueros sin perder ninguna vida en los 75s
+        self.vidas_promedio = 0.0   # Vidas restantes promedio al terminar
+        self.bajas_promedio = 0.0   # Bajas promedio de la población
         self.nuevas_partidas()
     
     def nuevas_partidas(self):
@@ -375,26 +403,44 @@ class Entrenador:
         return vivos #Cuantoss arqueros siguen vivos
     
     def evolucionar(self):
-        #Ordena los cerebros de mayor a menor fitness
+        # Calcula fitness actual y guarda historial móvil por cerebro
         puntajes = [j.fitness() for j in self.juegos]
-        orden = sorted(range(POBLACION),key=lambda i: puntajes[i], reverse=True)
+        for i, c in enumerate(self.cerebros):
+            c.hist_fit.append(puntajes[i])
+            c.hist_fit = c.hist_fit[-4:] # Promedia hasta 4 generaciones para estabilidad
+
+        # Ordena por fitness histórico promedio (reduce el impacto de semillas con suerte)
+        media_fit = lambda c: sum(c.hist_fit) / len(c.hist_fit)
+        orden = sorted(range(POBLACION), key=lambda i: media_fit(self.cerebros[i]), reverse=True)
+
         mejor_puntaje = puntajes[orden[0]]
         promedio = sum(puntajes) / POBLACION
-        self.historial.append((mejor_puntaje,promedio))
-        self.ultimos_sobrevivientes = sum (j.vidas > 0 for j in self.juegos)
+        self.historial.append((mejor_puntaje, promedio))
+
+        # Métricas de supervivencia real y partidas sin daño
+        self.pct_perfectas = (sum(1 for j in self.juegos if j.vidas == VIDAS and j.tiempo >= MAX_DURACION_GENERACION) / POBLACION) * 100.0
+        self.vidas_promedio = sum(j.vidas for j in self.juegos) / POBLACION
+        self.bajas_promedio = sum(j.bajas for j in self.juegos) / POBLACION
+        self.ultimos_sobrevivientes = sum(1 for j in self.juegos if j.vidas > 0 and j.tiempo >= MAX_DURACION_GENERACION)
+
+        # Los élites se preservan conservando su historial de evaluaciones
         elites = [self.cerebros[i] for i in orden[:ELITE]]
-        nueva_generacion = [e.clonar() for e in elites]
+        nueva_generacion = [e.clonar(mantener_historial=True) for e in elites]
+
+        # Decaimiento de sigma: explora al inicio y afina puntería con precisión milimétrica al avanzar
+        sigma = max(0.02, 0.25 * (0.985 ** self.generacion))
 
         pesos_seleccion = [ELITE - r for r in range(ELITE)]
         while len(nueva_generacion) < POBLACION:
-            if random.random()<0.3:
-                #30% de cruzar genes entre elites
-                padre1,padre2 = random.choices(elites,weights=pesos_seleccion, k=2)
-                hijo=Cerebro.cruzar(padre1,padre2)
+            if random.random() < 0.2:
+                # 20% cruce por neurona entre dos élites
+                padre1, padre2 = random.choices(elites, weights=pesos_seleccion, k=2)
+                hijo = Cerebro.cruzar(padre1, padre2)
             else:
-                padre = random.choices (elites, weights=pesos_seleccion)[0]
-                hijo = padre.clonar()
-            hijo.mutar(MUTACION, random.choice(MUTACION_SIGMAS))
+                # 80% clonación asexual directa de un élite
+                padre = random.choices(elites, weights=pesos_seleccion)[0]
+                hijo = padre.clonar(mantener_historial=False)
+            hijo.mutar(MUTACION, sigma)
             nueva_generacion.append(hijo)
         self.cerebros = nueva_generacion
         self.generacion += 1
@@ -806,7 +852,10 @@ class App:
                    f"Tiempo:      {t.frame / 60:.1f}/{MAX_DURACION_GENERACION // 60} s\n"
                    f"Mejor ahora: {mejor_ahora:.1f}\n"
                    f"Récord:      {record}\n"
-                   f"Sobrev. ant: {t.ultimos_sobrevivientes}\n\n"
+                   f"Sobrev. ant: {t.ultimos_sobrevivientes}/{POBLACION}\n"
+                   f"Perfectas:   {t.pct_perfectas:.0f}%\n"
+                   f"Vidas prom:  {t.vidas_promedio:.2f}\n"
+                   f"Bajas prom:  {t.bajas_promedio:.1f}\n\n"
                    f"Viendo #{self.indice_vista + 1}:\n"
                    f"  Bajas:     {g.bajas}\n"
                    f"  Vidas:     {g.vidas}\n"
@@ -856,14 +905,15 @@ class App:
             if self.entrenador is None:
                 self.entrenador = Entrenador()
 
-            # Modo IA: simulamos N pasos según el slider de velocidad
-            pasos = self.velocidad.get()
-            for _ in range(pasos):
-                vivos = self.entrenador.avanzar()
-                if vivos == 0:
-                    if self.auto_avanzar.get():
-                        self.entrenador.evolucionar()
-                    break
+            # Modo IA: solo simula si aún quedan arqueros activos en la oleada
+            if self.entrenador.vivos > 0:
+                pasos = self.velocidad.get()
+                for _ in range(pasos):
+                    vivos = self.entrenador.avanzar()
+                    if vivos == 0:
+                        if self.auto_avanzar.get():
+                            self.entrenador.evolucionar()
+                        break
 
             # Dibujamos al arquero seleccionado actualmente
             juego_actual = self.entrenador.juegos[self.indice_vista]
