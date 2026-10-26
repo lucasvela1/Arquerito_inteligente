@@ -1,2 +1,3 @@
-
 GUIA_PASO_A_PASO.md
+__pycache__/
+*.pyc
