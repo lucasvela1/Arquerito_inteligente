@@ -21,6 +21,7 @@ V_MIN, V_MAX = 5.0, 17.5
 ANG_MIN, ANG_MAX = -85.0, 75.0
 MAX_DURACION_GENERACION = 60 * 75
 COOLDOWN = 30       # Frames de espera para disparo de flechas
+FRAMES_TENSADO = 12 # Frames fijos de tensado del arco (animación de cuerda y flecha)
 TIEMPO_CARGA = 1.2   # Tiempo en segundos que se puede mantener presionado para cargar el disparo
 
 TIPOS_ENEMIGOS = {
@@ -36,7 +37,7 @@ PESO_TIPOS = [TIPOS_ENEMIGOS[k]["w"] for k in TIPOS]
 
 #Configuración neuronal:
 SENSORES_ENTRADA = 7 #7 sensores de entrada, lo que nos interesa que considere la red
-SENSORES_OCULTA = 8
+SENSORES_OCULTA = 12 #Aumentado de 8 a 12 para facilitar el cálculo balístico de objetivos rápidos (corredores)
 NEURONAS_SALIDA = 2 #La idea es que la ia decida con que angulo disparar y con qué potencia
 
 POBLACION = 100 #Comenzamos con 100 arqueros que nos interesa que mejoren con cada generación
@@ -166,12 +167,41 @@ class Juego:
         self.tiempo = 0
         self.spawn_timer = 60
         self.cool = 0
-        self.shaping = 0.0 #Puntos por tiros cercanos, es para premiar
-        self.terminado =False #Si temrina el run de la ia
+        self.shaping = 0.0 # Puntos por tiros cercanos, es para premiar
+        self.terminado = False # Si termina el run de la ia
+
+        # Simulación de tensión y carga del arco (tiempo que el arquero mantiene la cuerda estirada)
+        self.cargando = False
+        self.carga_potencia = 0.0
+        self.carga_angulo = 0.0
+        self.frames_carga = 0
+        self.frames_carga_total = 0
+
+    def preparar_disparo(self, potencia_normalizada, angulo_grados):
+        # La IA tensa el arco; el tiempo de tensado es constante (FRAMES_TENSADO)
+        # para no penalizar con retraso los disparos de máxima potencia
+        if self.vidas <= 0 or self.cool > 0 or self.cargando:
+            return False
+        self.cargando = True
+        self.carga_potencia = max(0.1, min(1.0, potencia_normalizada))
+        self.carga_angulo = angulo_grados
+        self.frames_carga_total = FRAMES_TENSADO
+        self.frames_carga = FRAMES_TENSADO
+        return True
+
+    def potencia_actual(self):
+        # Retorna el porcentaje actual de tensión (0.0 a 1.0) para la animación visual
+        if not self.cargando or self.frames_carga_total <= 0:
+            return 0.0
+        progreso = 1.0 - (self.frames_carga / self.frames_carga_total)
+        return self.carga_potencia * progreso
 
     def _recompensar_tiro_cercano(self, flecha):
-        #Si pasa a menos de 150px, nos da +4 puntos
-        self.shaping+=max(0.0,1.0-flecha.mejor_distancia/150.0)*4.0    
+        # Si pasa a menos de 150px, nos da puntos proporcionales a la cercanía
+        if flecha.mejor_distancia < 150.0:
+            # Bonus adicional de aprendizaje si el objetivo era un corredor veloz
+            factor = 1.8 if (flecha.objetivo and flecha.objetivo.tipo == "corredor") else 1.0
+            self.shaping += max(0.0, 1.0 - flecha.mejor_distancia / 150.0) * 4.0 * factor    
     
     def sensores(self): 
         #Se normalizan los 7 valores que buscamos, se toman valores de 0 a 1 para que ninguno predomine sobre el otro
@@ -201,14 +231,14 @@ class Juego:
         self.enemigos.append(e)
         self.spawn_timer = int(self.rng.uniform(90, 150) * (1 - 0.5 * diff))
 
-    def disparar(self, potencia_normalizada, angulo_grados):
+    def disparar(self, potencia_normalizada, angulo_grados, cool=COOLDOWN):
         if self.vidas <= 0 or self.cool > 0:
             return False
         potencia = V_MIN + (V_MAX - V_MIN) * max(0.0, min(1.0, potencia_normalizada))
         objetivo = min(self.enemigos, key=lambda e: e.x) if self.enemigos else None # Toma el más cercano
         nueva_flecha = Flecha(ARQUERO_X, ARQUERO_Y, potencia, angulo_grados, objetivo)
         self.flechas.append(nueva_flecha)
-        self.cool = COOLDOWN
+        self.cool = cool
         return True
     
     def fitness(self):
@@ -222,6 +252,14 @@ class Juego:
         self.tiempo += 1
         if self.cool > 0:
             self.cool -= 1
+
+        # Procesa la tensión del arco si se está preparando un disparo
+        if self.cargando:
+            self.frames_carga -= 1
+            if self.frames_carga <= 0:
+                self.cargando = False
+                self.disparar(self.carga_potencia, self.carga_angulo, cool=max(1, COOLDOWN - FRAMES_TENSADO))
+
         self.spawn()
 
         for enemigo in self.enemigos:
@@ -248,6 +286,8 @@ class Juego:
                     enemigo.vivo = False
                     flecha.activa = False
                     self.bajas += 1
+                    if enemigo.tipo == "corredor":
+                        self.shaping += 3.0 # Recompensa extra por eliminar a los corredores rápidos
                     break
         
         self.enemigos = [e for e in self.enemigos if e.vivo]
@@ -273,10 +313,11 @@ class Entrenador:
         for cerebro, juego in zip(self.cerebros, self.juegos):
             if juego.terminado:
                 continue
-            if juego.cool <= 0 and juego.enemigos: # Si no se esta recargando y hay enemigos
+            # Solo si no se está recargando (cooldown), ni tensando la cuerda actualmente, y hay enemigos a la vista
+            if juego.cool <= 0 and not juego.cargando and juego.enemigos:
                 potencia, angulo_01 = cerebro.forward(juego.sensores()) # usa sus sensores para calcular potencia y angulo
                 angulo_grados = ANG_MIN + (ANG_MAX - ANG_MIN) * angulo_01 # convierte el valor entre 0 y 1 a grados
-                juego.disparar(potencia, angulo_grados)
+                juego.preparar_disparo(potencia, angulo_grados)
 
             juego.actualizar()
             if not juego.terminado:
@@ -429,6 +470,11 @@ class App:
     def siguiente_generacion(self):
         if self.entrenador is None or self.modo != "ia":
             return
+        # Si todavía hay arqueros vivos jugando la oleada, simulamos rápidamente hasta el final
+        # para que todos los arqueros sean evaluados con sus bajas y puntuaciones reales
+        while self.entrenador.vivos > 0:
+            if not self.entrenador.avanzar():
+                break
         self.entrenador.evolucionar()
         self.indice_vista = 0
 
@@ -561,9 +607,13 @@ class App:
             ang = self.angulo_apuntado
             p = self.calcular_potencia()
         else:
-            angulo_01 = cerebro.salida[1] if cerebro else 0.5
-            ang = ANG_MIN + (ANG_MAX - ANG_MIN) * angulo_01
-            p = cerebro.salida[0] if cerebro else 0.5
+            if juego.cargando:
+                ang = juego.carga_angulo
+                p = juego.potencia_actual()
+            else:
+                angulo_01 = cerebro.salida[1] if cerebro else 0.5
+                ang = ANG_MIN + (ANG_MAX - ANG_MIN) * angulo_01
+                p = 0.0
             self.angulo_apuntado = ang
 
         rad = math.radians(ang)
@@ -584,6 +634,15 @@ class App:
         else:
             c.create_line(ARQUERO_X, ARQUERO_Y, ARQUERO_X + L * math.cos(rad), ARQUERO_Y - L * math.sin(rad),
                           dash=(4, 4), fill=ACENTO2, tags=T)
+
+            # Barra de carga de potencia para la IA (muestra visual de la tensión del arco)
+            bx, by = 10, PISO - 228
+            c.create_rectangle(bx, by, bx + 72, by + 10, outline="#e8e6f0", tags=T)
+            if p > 0:
+                c.create_rectangle(bx + 1, by + 1, bx + 1 + 70 * p, by + 9, fill=ACENTO2, outline="", tags=T)
+            if juego.cool > 0:
+                c.create_rectangle(bx, by + 13, bx + 72 * juego.cool / COOLDOWN, by + 16, fill=MUTED, outline="", tags=T)
+
             t = self.entrenador
             tag = "  (élite)" if t and t.generacion > 1 and self.indice_vista < ELITE else ""
             c.create_text(ANCHO / 2, 16, text=f"Gen {t.generacion} · Arquero #{self.indice_vista + 1}{tag}",
@@ -603,11 +662,34 @@ class App:
         c.create_line(ax, PISO - 145, ax, PISO - 162, fill="#2b2d42", width=5, tags=T)  # Cuerpo
         c.create_oval(ax - 5, PISO - 173, ax + 5, PISO - 163, fill="#f1c27d", outline="", tags=T)  # Cabeza
         c.create_arc(ax - 6, PISO - 176, ax + 6, PISO - 164, start=0, extent=180, fill="#2d6a4f", outline="", tags=T)  # Gorro
-        c.create_line(ax, PISO - 157, ARQUERO_X, ARQUERO_Y, fill="#2b2d42", width=3, tags=T)  # Brazo
 
-        # Arco
+        # Extremos del arco
         R = 15
+        p1 = (ARQUERO_X + R * math.cos(math.radians(ang - 75)), ARQUERO_Y - R * math.sin(math.radians(ang - 75)))
+        p2 = (ARQUERO_X + R * math.cos(math.radians(ang + 75)), ARQUERO_Y - R * math.sin(math.radians(ang + 75)))
+
+        # Retroceso de la cuerda hacia atrás proporcional a la potencia cargada (tensión)
+        retroceso = 14 * p
+        pm = ((p1[0] + p2[0]) / 2 - retroceso * math.cos(rad),
+              (p1[1] + p2[1]) / 2 + retroceso * math.sin(rad))
+
+        # Cuerda tensada en dos tramos
+        c.create_line(p1[0], p1[1], pm[0], pm[1], fill="#eeeeee", width=1, tags=T)
+        c.create_line(pm[0], pm[1], p2[0], p2[1], fill="#eeeeee", width=1, tags=T)
+
+        # Brazo frontal que sostiene el arco
+        c.create_line(ax, PISO - 157, ARQUERO_X, ARQUERO_Y, fill="#2b2d42", width=3, tags=T)
+        # Brazo trasero que estira la cuerda
+        c.create_line(ax, PISO - 157, pm[0], pm[1], fill="#2b2d42", width=3, tags=T)
+
+        # Madera del arco
         c.create_arc(ARQUERO_X - R, ARQUERO_Y - R, ARQUERO_X + R, ARQUERO_Y + R, start=ang - 75, extent=150, style="arc", outline="#d4a373", width=3, tags=T)
+
+        # Flecha apoyada en la cuerda si hay tensión
+        if p > 0.05:
+            punta_x = pm[0] + 20 * math.cos(rad)
+            punta_y = pm[1] - 20 * math.sin(rad)
+            c.create_line(pm[0], pm[1], punta_x, punta_y, fill="#f4e9cd", width=2, arrow=tk.LAST, arrowshape=(7, 8, 3), tags=T)
 
         # Enemigos
         for e in juego.enemigos:
