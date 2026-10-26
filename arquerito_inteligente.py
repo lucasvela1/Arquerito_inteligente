@@ -10,6 +10,26 @@ TEXTO = "#e8e6f0"
 MUTED = "#8b8aa6"
 ACENTO = "#f4a261"
 ACENTO2 = "#4cc9f0"
+NEG = "#f72585"
+NN_BG = "#0d0f1a"
+
+NOMBRES_ENTRADAS = [
+    "Dist E1", "Alt E1", "VelX E1", "VelY E1",
+    "Dist E2", "Alt E2", "VelX E2", "VelY E2",
+    "Cantidad"
+]
+NOMBRES_SALIDAS = ["Potencia", "Ángulo"]
+
+
+def _hex(c):
+    return tuple(int(c[i:i + 2], 16) for i in (1, 3, 5))
+
+
+def blend(c1, c2, t):
+    """Interpola dos colores hexadecimales con factor t entre 0.0 y 1.0."""
+    t = max(0.0, min(1.0, t))
+    a, b = _hex(c1), _hex(c2)
+    return "#%02x%02x%02x" % tuple(int(a[i] + (b[i] - a[i]) * t) for i in range(3))
 
 ANCHO, ALTO = 960, 440
 PISO = 390
@@ -18,7 +38,7 @@ ARQUERO_X, ARQUERO_Y = 58, PISO - 155
 GRAVEDAD = 0.25
 VIDAS = 5
 V_MIN, V_MAX = 5.0, 17.5
-ANG_MIN, ANG_MAX = -15.0, 65.0 # Rango balístico útil: evita tiros al pasto y centra el disparo en parábolas reales
+ANG_MIN, ANG_MAX = -80.0, 30.0 # Rango tenso único: de la puerta (-80°) a tiro largo (+30°), sin tiros globo
 MAX_DURACION_GENERACION = 60 * 75
 COOLDOWN = 30       # Frames de espera para disparo de flechas
 FRAMES_TENSADO = 12 # Frames fijos de tensado del arco (animación de cuerda y flecha)
@@ -36,7 +56,7 @@ PESO_TIPOS = [TIPOS_ENEMIGOS[k]["w"] for k in TIPOS]
 
 
 #Configuración neuronal:
-SENSORES_ENTRADA = 7 #7 sensores de entrada, lo que nos interesa que considere la red
+SENSORES_ENTRADA = 9 # 9 sensores: dist, alt, vel_x, vel_y para los 2 más cercanos + cantidad total
 SENSORES_OCULTA = 12 #Aumentado de 8 a 12 para facilitar el cálculo balístico de objetivos rápidos (corredores)
 NEURONAS_SALIDA = 2 #La idea es que la ia decida con que angulo disparar y con qué potencia
 
@@ -64,11 +84,14 @@ class Enemigo:
         self.y = self.base_y
         self.phase = rng.uniform (0, 6.28) #Esto indica la posicion inicial del movimiento senoidal, los voladores hacen un movimiento senoidal, suben y bajan     
         self.vivo = True
+        self.vy = 0.0 # Velocidad vertical por frame
 
     def actualizar(self, frame_juego):#frame_juego es para que todos los enemigos se muevan al mismo ritmo
         self.x -= self.vel #se acerca a nuestro cero, o sea, nuestro castillo
+        y_ant = self.y
         if self.vuela:                
             self.y = self.base_y + math.sin(frame_juego *0.07 + self.phase) * 22 #Esto indica un movimiento senoidal en el eje y
+        self.vy = self.y - y_ant # Velocidad vertical real del frame (permite a la red predecir subida/bajada)
 class Flecha:
     def __init__(self, x, y, potencia, angulo_grados, objetivo=None): #Agregamos un objetivo, es para la red neuronal para que sepa que falló o acertó
         self.x = x
@@ -170,24 +193,27 @@ class Juego:
         self.tiempo = 0
         self.spawn_timer = 60
         self.cool = 0
-        self.shaping = 0.0 # Puntos por tiros cercanos, es para premiar
+        self.shaping = 0.0 # Puntos auxiliares por tiros cercanos (máx 1.5 pts por flecha)
         self.terminado = False # Si termina el run de la ia
+        self.bolsa_spawn = [] # Bolsa de tipos para spawn balanceado sin sesgo de semilla
 
         # Simulación de tensión y carga del arco (tiempo que el arquero mantiene la cuerda estirada)
         self.cargando = False
         self.carga_potencia = 0.0
         self.carga_angulo = 0.0
+        self.carga_objetivo = None # Objetivo fijado al iniciar el tensado (evita desfase de 12 frames)
         self.frames_carga = 0
         self.frames_carga_total = 0
 
     def preparar_disparo(self, potencia_normalizada, angulo_grados):
         # La IA tensa el arco; el tiempo de tensado es constante (FRAMES_TENSADO)
-        # para no penalizar con retraso los disparos de máxima potencia
         if self.vidas <= 0 or self.cool > 0 or self.cargando:
             return False
         self.cargando = True
         self.carga_potencia = max(0.1, min(1.0, potencia_normalizada))
         self.carga_angulo = angulo_grados
+        # Fijamos el objetivo en el momento que la red decide disparar
+        self.carga_objetivo = min(self.enemigos, key=lambda e: e.x) if self.enemigos else None
         self.frames_carga_total = FRAMES_TENSADO
         self.frames_carga = FRAMES_TENSADO
         return True
@@ -200,27 +226,26 @@ class Juego:
         return self.carga_potencia * progreso
 
     def _recompensar_tiro_cercano(self, flecha):
-        # Radio amplio (280px) para dar gradiente continuo de aprendizaje aunque el tiro quede corto
-        RADIO_SHAPING = 280.0
+        # Shaping bajo (máx 1.5 pts): elimina el exploit de "farming"; matar (10 pts) siempre es superior
+        RADIO_SHAPING = 160.0
         if flecha.mejor_distancia < RADIO_SHAPING:
-            # Bonus adicional de aprendizaje si el objetivo era un corredor veloz
-            factor = 1.8 if (flecha.objetivo and flecha.objetivo.tipo == "corredor") else 1.0
-            self.shaping += max(0.0, 1.0 - flecha.mejor_distancia / RADIO_SHAPING) * 5.0 * factor    
+            self.shaping += max(0.0, 1.0 - flecha.mejor_distancia / RADIO_SHAPING) * 1.5
     
     def sensores(self): 
-        #Se normalizan los 7 valores que buscamos, se toman valores de 0 a 1 para que ninguno predomine sobre el otro
-        cercanos = sorted(self.enemigos, key=lambda e: e.x)[:2] #tomamos los dos más cercanos
-        datos= []
+        # 9 sensores: dist, alt, vel_x, vel_y para los 2 más cercanos + cantidad total
+        cercanos = sorted(self.enemigos, key=lambda e: e.x)[:2]
+        datos = []
         for i in range(2):
             if i < len(cercanos):
-                e=cercanos[i]
-                distancia= (e.x - CASTILLO_X)/(ANCHO-CASTILLO_X)
-                altura=(PISO-e.y)/200
-                velocidad= e.vel/4.0
-                datos.extend([distancia,altura,velocidad])
+                e = cercanos[i]
+                distancia = (e.x - CASTILLO_X) / (ANCHO - CASTILLO_X)
+                altura = (PISO - e.y) / 200.0
+                vel_x = e.vel / 4.0
+                vel_y = (e.vy + 2.0) / 4.0 # Normalizado entre 0 y 1 (-2 a +2 px/frame)
+                datos.extend([distancia, altura, vel_x, vel_y])
             else:
-                datos.extend([1.0,0.0,0.0]) #No hay enemigos o solo hay uno
-        cantidad_normalizada = min(len(self.enemigos),10)/10.0 #Cantidad normalizada de cantidad de enemigos
+                datos.extend([1.0, 0.0, 0.0, 0.5])
+        cantidad_normalizada = min(len(self.enemigos), 10) / 10.0
         datos.append(cantidad_normalizada)
         return datos
 
@@ -229,17 +254,23 @@ class Juego:
         if self.spawn_timer > 0:
             return
         diff = min(1.0, self.tiempo / (60 * 60)) # La dificultad sube durante 60 seg
-        tipo = self.rng.choices(TIPOS, weights=PESO_TIPOS)[0]
+        # Bolsa equilibrada: garantiza misma variedad en cada ciclo de 10 enemigos (evita overfitting de semilla)
+        if not self.bolsa_spawn:
+            bolsa = ["soldado"] * 4 + ["corredor"] * 2 + ["tanque"] * 2 + ["murcielago"] * 2
+            self.rng.shuffle(bolsa)
+            self.bolsa_spawn = bolsa
+        tipo = self.bolsa_spawn.pop()
         e = Enemigo(tipo, self.rng)
         e.vel *= 1 + 0.5 * diff # La velocidad aumenta con la dificultad
         self.enemigos.append(e)
         self.spawn_timer = int(self.rng.uniform(90, 150) * (1 - 0.5 * diff))
 
-    def disparar(self, potencia_normalizada, angulo_grados, cool=COOLDOWN):
+    def disparar(self, potencia_normalizada, angulo_grados, cool=COOLDOWN, objetivo=None):
         if self.vidas <= 0 or self.cool > 0:
             return False
         potencia = V_MIN + (V_MAX - V_MIN) * max(0.0, min(1.0, potencia_normalizada))
-        objetivo = min(self.enemigos, key=lambda e: e.x) if self.enemigos else None # Toma el más cercano
+        if objetivo is None:
+            objetivo = min(self.enemigos, key=lambda e: e.x) if self.enemigos else None
         nueva_flecha = Flecha(ARQUERO_X, ARQUERO_Y, potencia, angulo_grados, objetivo)
         self.flechas.append(nueva_flecha)
         self.cool = cool
@@ -247,7 +278,8 @@ class Juego:
     
     def fitness(self):
         vidas_perdidas = VIDAS - self.vidas
-        return self.bajas*10+self.shaping - vidas_perdidas* 8 +(self.tiempo/60)*1.0 
+        # Penalización severa por vida (-20 pts): dejar pasar enemigos para farmear destruye el score
+        return self.bajas * 10.0 + self.shaping - vidas_perdidas * 20.0 + (self.tiempo / 60.0) * 1.0
 
     def actualizar(self):
         if self.vidas <= 0 or self.tiempo>= MAX_DURACION_GENERACION: 
@@ -262,7 +294,7 @@ class Juego:
             self.frames_carga -= 1
             if self.frames_carga <= 0:
                 self.cargando = False
-                self.disparar(self.carga_potencia, self.carga_angulo, cool=max(1, COOLDOWN - FRAMES_TENSADO))
+                self.disparar(self.carga_potencia, self.carga_angulo, cool=max(1, COOLDOWN - FRAMES_TENSADO), objetivo=self.carga_objetivo)
 
         self.spawn()
 
@@ -367,6 +399,206 @@ class Entrenador:
         self.cerebros = nueva_generacion
         self.generacion += 1
         self.nuevas_partidas()
+
+
+# ======================= VENTANA DE LA RED NEURONAL ========================
+class VentanaRed:
+    ANCHO_V, ALTO_V = 660, 600
+
+    def __init__(self, root):
+        self.top = tk.Toplevel(root)
+        self.top.title("Red neuronal · Pesos y decisiones en vivo")
+        self.top.configure(bg=BG_UI)
+        self.top.resizable(False, False)
+        self.c = tk.Canvas(self.top, width=self.ANCHO_V, height=self.ALTO_V, bg=NN_BG, highlightthickness=0)
+        self.c.pack(padx=8, pady=8)
+        self.abierta = True
+        self.hover = None
+        self.top.protocol("WM_DELETE_WINDOW", self.cerrar)
+        self.c.bind("<Motion>", self.al_mover_mouse)
+        self.c.bind("<Leave>", lambda e: setattr(self, "hover", None))
+
+        # Coordenadas (x, y) de cada neurona
+        self.pos = {}
+        # 10 nodos de entrada (9 sensores + 1 bias)
+        self._columna("i", SENSORES_ENTRADA + 1, 175, 55, 385)
+        # 13 nodos ocultos (12 neuronas + 1 bias)
+        self._columna("h", SENSORES_OCULTA + 1, 360, 48, 392)
+        # 2 nodos de salida (Potencia, Ángulo)
+        self._columna("o", NEURONAS_SALIDA, 525, 170, 270)
+
+    def _columna(self, capa, n, x, y0, y1):
+        paso = (y1 - y0) / (n - 1) if n > 1 else 0
+        for k in range(n):
+            self.pos[(capa, k)] = (x, y0 + k * paso)
+
+    def cerrar(self):
+        self.abierta = False
+        self.top.destroy()
+
+    def al_mover_mouse(self, ev):
+        self.hover = None
+        for clave, (x, y) in self.pos.items():
+            if (ev.x - x) ** 2 + (ev.y - y) ** 2 < 15 ** 2:
+                self.hover = clave
+                break
+
+    @staticmethod
+    def _color_peso(w):
+        return blend(NN_BG, ACENTO2 if w > 0 else NEG, 0.2 + min(0.8, abs(w) / 2.5))
+
+    @staticmethod
+    def _color_nodo(a):
+        return blend("#1b1f33", ACENTO2 if a > 0 else NEG, min(1.0, abs(a)))
+
+    def actualizar(self, cerebro, titulo, historial):
+        c = self.c
+        c.delete("all")
+        P = self.pos
+        c.create_text(16, 12, anchor="nw", text=titulo, fill=TEXTO, font=("Segoe UI", 12, "bold"))
+        for txt, x in (("Entradas", 175), ("Oculta (tanh)", 360), ("Salidas (sigmoide)", 525)):
+            c.create_text(x, 34, text=txt, fill=MUTED, font=("Segoe UI", 9))
+
+        inp = cerebro.entrada + [1.0]
+        hid = cerebro.oculta + [1.0]
+        hv = self.hover
+
+        # --- Conexiones sinápticas (peso > 0 azul, peso < 0 rosa) ---
+        def dibujar_linea(a, b, w, resalta):
+            (x1, y1), (x2, y2) = P[a], P[b]
+            grosor = 1 + min(3.5, abs(w) * 1.2)
+            color = (ACENTO2 if w > 0 else NEG) if resalta else self._color_peso(w)
+            c.create_line(x1, y1, x2, y2, fill=color, width=grosor + (1.5 if resalta else 0))
+
+        for j in range(SENSORES_OCULTA):
+            for i in range(SENSORES_ENTRADA + 1):
+                dibujar_linea(("i", i), ("h", j), cerebro.w_ih(i, j), hv in (("i", i), ("h", j)))
+
+        for k in range(NEURONAS_SALIDA):
+            for j in range(SENSORES_OCULTA + 1):
+                dibujar_linea(("h", j), ("o", k), cerebro.w_ho(j, k), hv in (("h", j), ("o", k)))
+
+        # --- Neuronas ---
+        def dibujar_nodo(clave, val, etiqueta, es_bias=False):
+            x, y = P[clave]
+            r = 10 if clave[0] == "h" else 11
+            relleno = "#3a3d55" if es_bias else self._color_nodo(val)
+            borde = "#ffffff" if clave == hv else "#555a7a"
+            c.create_oval(x - r, y - r, x + r, y + r, fill=relleno, outline=borde, width=2 if clave == hv else 1)
+            c.create_text(x, y, text=etiqueta, fill=TEXTO, font=("Segoe UI", 7, "bold"))
+
+        for i in range(SENSORES_ENTRADA + 1):
+            es_bias = (i == SENSORES_ENTRADA)
+            dibujar_nodo(("i", i), inp[i], "b" if es_bias else str(i + 1), es_bias)
+            x, y = P[("i", i)]
+            nombre = "Bias" if es_bias else NOMBRES_ENTRADAS[i]
+            c.create_text(x - 18, y, anchor="e", text=f"{nombre}  {inp[i]:+.2f}",
+                          fill=MUTED if es_bias else TEXTO, font=("Consolas", 8))
+
+        for j in range(SENSORES_OCULTA + 1):
+            es_bias = (j == SENSORES_OCULTA)
+            dibujar_nodo(("h", j), hid[j], "b" if es_bias else f"H{j + 1}", es_bias)
+
+        potencia, ang01 = cerebro.salida
+        angulo = ANG_MIN + (ANG_MAX - ANG_MIN) * ang01
+        vel = V_MIN + (V_MAX - V_MIN) * potencia
+        for k, txt in enumerate((f"Potencia\n{potencia:.0%}", f"Ángulo\n{angulo:.1f}°")):
+            dibujar_nodo(("o", k), cerebro.salida[k], "P" if k == 0 else "A")
+            x, y = P[("o", k)]
+            c.create_text(x + 20, y, anchor="w", text=txt, fill=ACENTO, font=("Segoe UI", 10, "bold"))
+
+        # --- Panel de decisión del disparo ---
+        c.create_rectangle(16, 405, self.ANCHO_V - 16, 435, fill="#171a2b", outline="#2c3050")
+        c.create_text(self.ANCHO_V / 2, 420, fill=TEXTO, font=("Segoe UI", 10),
+                      text=f"Decisión → disparar a {angulo:.1f}° con {potencia:.0%} de potencia ({vel:.1f} px/frame)")
+
+        self._grafico_fitness(historial)
+        self._panel_detalle(cerebro, inp)
+
+    def _grafico_fitness(self, historial):
+        c = self.c
+        x0, y0, x1, y1 = 20, 448, 330, 585
+        c.create_rectangle(x0, y0, x1, y1, outline="#2c3050", fill="#121526")
+        c.create_text(x0 + 6, y0 - 9, anchor="w", text="Puntaje por generación",
+                      fill=MUTED, font=("Segoe UI", 9))
+        if not historial:
+            c.create_text((x0 + x1) / 2, (y0 + y1) / 2, text="Aún no hay generaciones completas",
+                          fill=MUTED, font=("Segoe UI", 9))
+            return
+        valores = [v for h in historial for v in h]
+        lo = min(0.0, min(valores))
+        hi = max(1.0, max(valores)) * 1.1
+        n = len(historial)
+
+        def punto(i, v):
+            x = x0 + 10 + (x1 - x0 - 20) * (i / max(1, n - 1))
+            y = y1 - 8 - (y1 - y0 - 16) * (v - lo) / max(0.001, hi - lo)
+            return x, y
+
+        for idx, color in ((1, ACENTO2), (0, "#ffd166")):
+            pts = [punto(i, h[idx]) for i, h in enumerate(historial)]
+            if len(pts) > 1:
+                c.create_line(*[p for xy in pts for p in xy], fill=color, width=2, smooth=True)
+            for x, y in pts[-1:]:
+                c.create_oval(x - 3, y - 3, x + 3, y + 3, fill=color, outline="")
+        c.create_text(x1 - 6, y0 + 8, anchor="ne", fill="#ffd166", font=("Segoe UI", 8),
+                      text=f"mejor {historial[-1][0]:.1f}")
+        c.create_text(x1 - 6, y0 + 22, anchor="ne", fill=ACENTO2, font=("Segoe UI", 8),
+                      text=f"promedio {historial[-1][1]:.1f}")
+
+    def _panel_detalle(self, cerebro, inp):
+        c = self.c
+        x0, y0, x1, y1 = 345, 448, self.ANCHO_V - 16, 585
+        c.create_rectangle(x0, y0, x1, y1, outline="#2c3050", fill="#121526")
+        c.create_text(x0 + 6, y0 - 9, anchor="w", text="Detalle de neurona", fill=MUTED, font=("Segoe UI", 9))
+        hv = self.hover
+        if hv is None:
+            lineas = [
+                "Pasa el mouse sobre una neurona",
+                "para ver sus pesos numéricos.",
+                "",
+                "Azul = peso positivo (excitatorio)",
+                "Rosa = peso negativo (inhibitorio)",
+                "Grosor = magnitud del peso"
+            ]
+        else:
+            capa, k = hv
+            if capa == "i":
+                nombre = "Bias" if k == SENSORES_ENTRADA else NOMBRES_ENTRADAS[k]
+                lineas = [f"Entrada: {nombre} ({inp[k]:+.2f})", "Pesos hacia capa oculta:"]
+                for j in range(0, SENSORES_OCULTA, 2):
+                    p1 = f"H{j+1}:{cerebro.w_ih(k, j):+.2f}"
+                    p2 = f"H{j+2}:{cerebro.w_ih(k, j+1):+.2f}" if j + 1 < SENSORES_OCULTA else ""
+                    lineas.append(f"  {p1:<12} {p2}")
+            elif capa == "h" and k == SENSORES_OCULTA:
+                lineas = ["Bias de capa oculta", "Pesos hacia salidas:"]
+                lineas += [f"  -> {NOMBRES_SALIDAS[o]}: {cerebro.w_ho(k, o):+.3f}" for o in range(NEURONAS_SALIDA)]
+            elif capa == "h":
+                lineas = [f"H{k + 1}  activación: {cerebro.oculta[k]:+.3f}", "Pesos desde entradas:"]
+                for i in range(0, SENSORES_ENTRADA + 1, 2):
+                    nom1 = "Bias" if i == SENSORES_ENTRADA else NOMBRES_ENTRADAS[i]
+                    p1 = f"{nom1}:{cerebro.w_ih(i, k):+.2f}"
+                    if i + 1 <= SENSORES_ENTRADA:
+                        nom2 = "Bias" if i + 1 == SENSORES_ENTRADA else NOMBRES_ENTRADAS[i + 1]
+                        p2 = f"{nom2}:{cerebro.w_ih(i + 1, k):+.2f}"
+                    else:
+                        p2 = ""
+                    lineas.append(f"  {p1:<14} {p2}")
+            else:
+                lineas = [f"{NOMBRES_SALIDAS[k]}  salida: {cerebro.salida[k]:.3f}", "Pesos desde oculta:"]
+                for j in range(0, SENSORES_OCULTA + 1, 2):
+                    nom1 = "Bias" if j == SENSORES_OCULTA else f"H{j + 1}"
+                    p1 = f"{nom1}:{cerebro.w_ho(j, k):+.2f}"
+                    if j + 1 <= SENSORES_OCULTA:
+                        nom2 = "Bias" if j + 1 == SENSORES_OCULTA else f"H{j + 2}"
+                        p2 = f"{nom2}:{cerebro.w_ho(j + 1, k):+.2f}"
+                    else:
+                        p2 = ""
+                    lineas.append(f"  {p1:<12} {p2}")
+        c.create_text(x0 + 8, y0 + 6, anchor="nw", text="\n".join(lineas[:10]),
+                      fill=TEXTO, font=("Consolas", 8))
+
+
 class App:
     CELDA = 17  # Tamaño en píxeles de cada celda de la cuadrícula de arqueros
 
@@ -379,7 +611,10 @@ class App:
         self.modo = "manual"
         self.juego_manual = Juego()
         self.entrenador = None
+        self.cerebro_demo = Cerebro() # Red de muestra para visualizar en modo manual
         self.indice_vista = 0  # Índice del arquero visualizado en pantalla (0 a 99)
+        self.ventana_red = None # Referencia a la ventana de inspección de la red neuronal
+        self.tick = 0
 
         self.mouse = (ANCHO / 2, ALTO / 2)
         self.tiempo_presionado = None
@@ -422,6 +657,7 @@ class App:
         self._seccion(panel, "ENTRENAMIENTO")
         self._boton(panel, "Siguiente generación ▶", self.siguiente_generacion)
         self._boton(panel, "Reiniciar entrenamiento", self.reiniciar_entrenamiento)
+        self._boton(panel, "Ver red neuronal", self.abrir_red)
 
         self.auto_avanzar = tk.BooleanVar(value=True)
         tk.Checkbutton(panel, text="Auto-avanzar generación", variable=self.auto_avanzar,
@@ -496,6 +732,32 @@ class App:
     def reiniciar_entrenamiento(self):
         self.entrenador = Entrenador()
         self.indice_vista = 0
+
+    def abrir_red(self):
+        # Abre o trae al frente la ventana de inspección de la red neuronal
+        if self.ventana_red is None or not self.ventana_red.abierta:
+            self.ventana_red = VentanaRed(self.root)
+        else:
+            self.ventana_red.top.lift()
+
+    def _actualizar_red(self):
+        if not (self.ventana_red and self.ventana_red.abierta):
+            return
+        if self.modo == "ia":
+            if self.entrenador is None:
+                return
+            t = self.entrenador
+            c, j = t.cerebros[self.indice_vista], t.juegos[self.indice_vista]
+            if not j.terminado:
+                c.forward(j.sensores())
+            titulo = f"Arquero #{self.indice_vista + 1} · Generación {t.generacion}"
+            historial = t.historial
+        else:
+            c = self.entrenador.cerebros[0] if self.entrenador else self.cerebro_demo
+            c.forward(self.juego_manual.sensores())
+            titulo = "Mejor arquero opinando sobre tu partida" if self.entrenador else "Red neuronal (modo manual)"
+            historial = self.entrenador.historial if self.entrenador else []
+        self.ventana_red.actualizar(c, titulo, historial)
 
     def al_click_cuadricula(self, ev):
         if self.entrenador is None:
@@ -609,7 +871,10 @@ class App:
             self.dibujar_entidades(juego_actual, es_manual=False, cerebro=cerebro_actual)
             self._actualizar_cuadricula()
 
-        self._actualizar_stats()
+        self.tick += 1
+        if self.tick % 3 == 0:
+            self._actualizar_stats()
+            self._actualizar_red()
         self.root.after(16, self.loop)
 
     def dibujar_entidades(self, juego, es_manual=True, cerebro=None):
